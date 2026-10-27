@@ -1,0 +1,85 @@
+from datetime import datetime, timedelta
+import secrets
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from passlib.context import CryptContext
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+# Assuming standard VulnTracker dependencies are imported from app context
+# from database import get_db
+# from models import Scan, SharedLink
+# from auth import get_current_active_user, User
+
+router = APIRouter(tags=["Sharing"])
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class ShareRequest(BaseModel):
+    password: str | None = Field(default=None, description="Optional password protection for the shared link")
+
+@router.post("/scans/{scan_id}/share", status_code=status.HTTP_201_CREATED)
+def create_shared_link(
+    scan_id: int,
+    payload: ShareRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)  # Enforces Bearer token auth
+):
+    # 1. Verify scan existence
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    
+    # 2. Generate secure token
+    token = secrets.token_urlsafe(32)
+    
+    # 3. Hash optional password
+    pwd_hash = pwd_context.hash(payload.password) if payload.password else None
+    
+    # 4. Create database record with 24-hour expiry
+    shared_link = SharedLink(
+        token=token,
+        scan_id=scan_id,
+        password_hash=pwd_hash,
+        expires_at=datetime.utcnow() + timedelta(hours=24)
+    )
+    db.add(shared_link)
+    db.commit()
+    
+    # 5. Build dynamic share URL using incoming request host
+    base_url = str(request.base_url).rstrip("/")
+    share_url = f"{base_url}/share/{token}"
+    
+    return {"share_url": share_url}
+
+
+@router.get("/share/{token}", status_code=status.HTTP_200_OK)
+def get_shared_scan(
+    token: str,
+    password: str | None = Query(default=None, description="Required if link is password-protected"),
+    db: Session = Depends(get_db)
+):
+    # 1. Retrieve share record
+    shared_link = db.query(SharedLink).filter(SharedLink.token == token).first()
+    if not shared_link:
+        raise HTTPException(status_code=404, detail="Invalid or non-existent share link")
+    
+    # 2. Check expiration (HTTP 410 Gone for expired resources)
+    if datetime.utcnow() > shared_link.expires_at:
+        raise HTTPException(status_code=410, detail="This share link has expired")
+    
+    # 3. Verify password if configured
+    if shared_link.password_hash:
+        if not password or not pwd_context.verify(password, shared_link.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid or missing password for this shared link")
+            
+    # 4. Fetch associated scan data
+    scan = db.query(Scan).filter(Scan.id == shared_link.scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Associated scan data no longer exists")
+        
+    return {
+        "scan_id": scan.id,
+        "results": scan.data,
+        "scanned_at": scan.created_at,
+        "expires_at": shared_link.expires_at
+    }
